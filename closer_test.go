@@ -15,7 +15,7 @@ func TestClose(t *testing.T) {
 	c := New()
 	ass.Equal(false, c.Closed())
 	ass.True(c.Close())
-	c.Wait()
+	_ = c.Wait(context.Background())
 	ass.Equal(true, c.Closed())
 	ass.False(c.Close())
 }
@@ -73,9 +73,17 @@ func TestContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c1 := WithContext(ctx)
 	c2 := WithContext(c1.Context())
+	c2.AddCallbacks(func() {
+		time.Sleep(1 * time.Second)
+	})
 	cancel()
-	c1.Wait()
-	c2.Wait()
+	_ = c1.Wait(context.Background())
+	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+	err := c2.Wait(ctx)
+	ass.Equal(err, context.DeadlineExceeded)
+	_ = c2.Wait(context.Background())
 	ass.Equal(true, c1.Closed())
 	ass.Equal(true, c2.Closed())
+	ass.False(c1.Close())
+	ass.False(c1.Close())
 }

@@ -13,7 +13,7 @@ type Closer interface {
 	Closed() bool
 
 	// Waiting all callback and context with the closer done.
-	Wait()
+	Wait(context.Context) error
 
 	// Chan returns a channel that's closed when the closer closed.
 	Chan() <-chan struct{}
@@ -42,35 +42,50 @@ func WithContext(ctx context.Context) Closer {
 }
 
 type closer struct {
-	locker    sync.Mutex
-	closed    bool
-	done      *done
-	wg        sync.WaitGroup
-	c         chan struct{}
+	locker sync.Mutex
+	done   chan struct{}
+	ref    uint32
+
 	callbacks []func()
-	ctx       context.Context
-	cancel    context.CancelFunc
+
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func newCloser() *closer {
+	c := &closer{}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.ref++
+
+	return c
 }
 
 func (c *closer) Close() bool {
 	defer c.locker.Unlock()
 	c.locker.Lock()
-	c.done.close()
-	if !c.closed {
-		c.closed = true
-		return true
+	if c.ref == 0 {
+		return false
 	}
-	return false
+	c.close()
+	if c.done != nil {
+		close(c.done)
+	}
+	return true
 }
 
 func (c *closer) Closed() bool {
 	defer c.locker.Unlock()
 	c.locker.Lock()
-	return c.closed
+	return c.ref == 0
 }
 
-func (c *closer) Wait() {
-	<-c.c
+func (c *closer) Wait(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return nil
+	}
 }
 
 func (c *closer) Chan() <-chan struct{} {
@@ -85,90 +100,67 @@ func (c *closer) AddCallbacks(cbs ...func()) {
 	add := func() bool {
 		defer c.locker.Unlock()
 		c.locker.Lock()
-		if !c.closed {
+		closed := c.ref == 0
+		if !closed {
+			if c.callbacks == nil {
+				c.callbacks = make([]func(), 0, len(cbs))
+			}
 			c.callbacks = append(c.callbacks, cbs...)
 		}
-		return c.closed
+		return closed
 	}
 
-	call := func() {
+	if !add() {
+		return
+	}
+
+	go func() {
 		for _, cb := range cbs {
 			cb()
 		}
-	}
-
-	if add() {
-		go call()
-	}
+	}()
 }
 
 func (c *closer) WithContext(ctx context.Context) {
 	defer c.locker.Unlock()
 	c.locker.Lock()
-	if c.closed {
+	if c.ref == 0 {
 		return
 	}
 
 	c.resetDone()
 
-	doneC := c.done
+	done := c.done
 	go func() {
 		select {
-		case <-doneC.c:
-			return
+		case <-done:
 		case <-ctx.Done():
-			c.Close()
 		}
+		c.Close()
 	}()
 }
 
-func (c *closer) init() {
-	c.locker.Lock()
-	doneC := c.done
-	c.locker.Unlock()
-
-	c.wg.Add(1)
-	go func() {
-		<-doneC.c
-		c.wg.Done()
-	}()
+func (c *closer) close() {
+	c.ref--
+	if c.ref > 0 {
+		return
+	}
+	callbacks := make([]func(), len(c.callbacks))
+	copy(callbacks, c.callbacks)
+	c.callbacks = nil
 
 	go func() {
-		c.wg.Wait()
-
-		c.locker.Lock()
-		c.cancel()
-		callbacks := make([]func(), len(c.callbacks))
-		copy(callbacks, c.callbacks)
-		c.callbacks = nil
-		c.locker.Unlock()
-
 		for _, cb := range callbacks {
 			cb()
 		}
-		<-c.ctx.Done()
-		close(c.c)
+		c.cancel()
 	}()
 }
 
 func (c *closer) resetDone() {
-	c.wg.Add(1)
-	c.done.close()
-	c.done = newDone()
-
-	go func() {
-		<-c.done.c
-		c.wg.Done()
-	}()
-}
-
-func newCloser() *closer {
-	c := &closer{}
-	c.callbacks = make([]func(), 0)
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.done = newDone()
-	c.c = make(chan struct{})
-	c.init()
-
-	return c
+	if (c.done != nil) {
+		c.ref++
+		close(c.done)
+	}
+	c.done = make(chan struct{})
 }
